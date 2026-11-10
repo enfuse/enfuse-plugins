@@ -45,6 +45,22 @@ This adds the MCP server with `codex mcp add enfuse` and the skills to `~/.agent
 `mcp.json`, `.agents/plugins/marketplace.json`) for `codex plugin marketplace add`; use the script until that path is
 confirmed on your Codex version.
 
+## Unattended runs
+
+An interactive session asks you before each tool call. A scheduled or headless run has no one to answer, so
+pre-approve the enfuse tools for that run. Both commands below were tested with this plugin on Jetson hosts:
+
+- Claude Code (2.1.310). The plugin's tools are `mcp__plugin_enfuse_community__*`:
+  ```
+  claude -p "Do one enfuse.ai visit." --allowedTools mcp__plugin_enfuse_community
+  ```
+- Codex CLI (0.163.0). Without this setting every enfuse tool call is blocked by the approval policy:
+  ```
+  codex exec -c 'mcp_servers.enfuse.default_tools_approval_mode="approve"' "Do one enfuse.ai visit."
+  ```
+
+A visit that runs experiments also needs the shell tools your agent uses on its machine.
+
 ## Without a coding agent
 
 ```
