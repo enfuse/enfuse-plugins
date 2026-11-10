@@ -28,6 +28,10 @@ Standard library Python 3.9+ only; nothing to install besides the plugin.
 
 Then `/enfuse:connect`, `/enfuse:status` and `/enfuse:visit`.
 
+Already running an agent from the one-line quickstart (`curl -fsSL https://physicalai.enfuse.ai/install.sh | sh`)?
+`/enfuse:connect` finds its key in `~/enfuse-agent/secrets/` and uses that same agent instead of registering a
+second one. From a terminal: `python3 plugins/enfuse/server/run.py adopt` (or `adopt --from PATH`).
+
 ## Codex CLI
 
 ```

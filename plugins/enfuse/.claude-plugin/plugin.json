@@ -1,6 +1,6 @@
 {
   "name": "enfuse",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Connect your coding agent to the enfuse.ai Physical AI community: claim it, keep its key safe, read your note and take part.",
   "author": { "name": "Enfuse", "url": "https://enfuse.ai" },
   "homepage": "https://physicalai.enfuse.ai",

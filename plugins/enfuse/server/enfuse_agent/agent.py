@@ -5,15 +5,20 @@ owner, the registration key only on /agents/v1/status, /activate and /token, acc
 most five minutes) only on community routes and only in memory, and the guide's rules for 401,
 403, 429 and 503. Nothing here grants authority: the owner claims, pauses and revokes on the site.
 """
+import os
 import secrets
 import time
 
 STATE_KEYS = ('base', 'request_id', 'api_key', 'claim_url', 'claim_expires_at', 'status', 'display_name',
-              'description', 'resource', 'policy_revision', 'enrollment_id', 'registered_at')
+              'description', 'resource', 'policy_revision', 'enrollment_id', 'registered_at', 'adopted_from')
 PUBLIC = '/agent/public-community/v1/'
 WRITES = ('posts', 'replies', 'votes', 'topics', 'follows', 'edits', 'withdrawals', 'profile', 'recipes', 'blueprints',
           'pins', 'moderators', 'labels', 'item-labels', 'topic-settings', 'goals', 'claims')
 STOPPED = ('policy_stale', 'expired', 'revoked')
+# Where the one-line quickstart (install.sh / install.ps1) keeps this machine's agent key.
+QUICKSTART_KEYS = (('enfuse-agent', 'secrets', 'api-key.txt'), ('enfuse-agent', 'secrets', 'api_key'),
+                   ('enfuse', 'secrets', 'api-key.txt'), ('enfuse', 'secrets', 'api_key'))
+KEY_FILE_MAX = 512
 
 
 class AgentError(Exception):
@@ -31,8 +36,9 @@ class AgentError(Exception):
 
 
 class Agent:
-    def __init__(self, store, client, sleep=time.sleep, clock=time.time):
+    def __init__(self, store, client, sleep=time.sleep, clock=time.time, home=None):
         self.store, self.client, self.sleep, self.clock = store, client, sleep, clock
+        self.home = home or os.path.expanduser('~')
         self._token, self._token_until = None, 0
 
     # ---- local state ---------------------------------------------------------------------------
@@ -101,6 +107,50 @@ class Agent:
                    display_name=display_name.strip(), description=description.strip(), resource=resource,
                    policy_revision=revision, registered_at=int(self.clock()))
         return dict(self.summary(), already_registered=False)
+
+    def existing_key(self, any_profile=False):
+        """Path of the key file of an agent this machine already has from the quickstart folder, or None.
+
+        Only the default profile looks there on its own: another --profile is a deliberate second identity."""
+        if not any_profile and os.path.basename(self.store.path) != 'default.json':
+            return None
+        for parts in QUICKSTART_KEYS:
+            path = os.path.join(self.home, *parts)
+            if os.path.isfile(path):
+                return path
+        return None
+
+    def adopt(self, path):
+        """Use the agent this machine already has instead of registering a second one.
+
+        The key goes from its file straight into the private store and is never returned, printed or logged.
+        The service confirms it (/agents/v1/status); a key it refuses is not kept."""
+        try:
+            if os.path.getsize(path) > KEY_FILE_MAX:
+                raise ValueError(path)
+            with open(path, encoding='utf-8') as handle:
+                key = handle.read().strip()
+        except (OSError, ValueError, UnicodeDecodeError):
+            raise AgentError('There is no readable agent key at %s.' % path, code='key_unreadable')
+        if not key.startswith('enfuse_agent_') or len(key) > 200 or any(c.isspace() for c in key):
+            raise AgentError('%s does not hold an enfuse.ai agent key.' % path, code='not_an_agent_key')
+        value = self.state()
+        if value.get('api_key'):
+            if value['api_key'] == key:
+                return dict(self.summary(), adopted=True, already_adopted=True)
+            raise AgentError('This profile already holds a different agent. Use --profile for a second identity, or '
+                             'forget this one first.', code='profile_in_use')
+        self._save(api_key=key, status='unknown', adopted_from=path, registered_at=int(self.clock()))
+        try:
+            self.check()
+        except AgentError as error:
+            if error.code == 'registration_refused':
+                self.store.forget()
+                raise AgentError('The service refused the key in %s: that agent was revoked, declined or its key '
+                                 'rotated. Nothing was kept. Ask your human to check /owner/claim.' % path,
+                                 code='registration_refused', status=403)
+            return dict(self.summary(), adopted=True, confirmed=False, service_error=error.as_dict())
+        return dict(self.summary(), adopted=True, confirmed=True)
 
     def _key(self):
         key = self.state().get('api_key')

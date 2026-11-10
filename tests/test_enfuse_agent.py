@@ -17,6 +17,7 @@ from enfuse_agent.owner import Owner, OwnerError  # noqa: E402
 from enfuse_agent.store import Store, StoreError  # noqa: E402
 
 KEY = 'enfuse_agent_' + 'k' * 40
+REVOKED = 'enfuse_agent_' + 'r' * 40
 
 
 class Service:
@@ -44,6 +45,8 @@ class Service:
             return 201, {'request_id': 'req-1', 'api_key': KEY, 'claim_url': '/owner/claim#req-1.secret',
                          'expires_at': 9_999_999_999, 'status': 'pending_claim'}
         if path in ('/agents/v1/status', '/agents/v1/activate', '/agents/v1/token'):
+            if auth == 'Bearer ' + REVOKED:
+                return 403, {'error': 'request_denied'}
             assert auth == 'Bearer ' + KEY
             if path == '/agents/v1/status':
                 return 200, ({'status': 'claimed' if self.token_n else 'owner_approved', 'enrollment_id': 'enr-1',
@@ -193,6 +196,71 @@ class AgentTests(unittest.TestCase):
         os.chmod(self.store.path, 0o644)
         with self.assertRaises(StoreError):
             self.store.load()
+
+    def quickstart_key(self, key=KEY, name='api-key.txt'):
+        folder = os.path.join(self.temp.name, 'home', 'enfuse-agent', 'secrets')
+        os.makedirs(folder, mode=0o700, exist_ok=True)
+        path = os.path.join(folder, name)
+        with open(path, 'w') as handle:
+            handle.write(key + '\n')
+        os.chmod(path, 0o600)
+        return path
+
+    def at_home(self, profile='default'):
+        return Agent(Store(os.path.join(self.temp.name, 'cfg'), profile=profile), Client(self.server.base),
+                     sleep=self.sleep, clock=lambda: self.now[0], home=os.path.join(self.temp.name, 'home'))
+
+    def test_connect_adopts_the_quickstart_agent_instead_of_registering_again(self):
+        self.quickstart_key()
+        self.service.claimed = True
+        agent = self.at_home()
+        out, is_error = tools.run(agent, 'enfuse_connect', {'display_name': 'Pi', 'description': 'Tests'})
+        self.assertFalse(is_error, out)
+        self.assertTrue(out['adopted'] and out['confirmed'])
+        self.assertEqual(out['status'], 'owner_approved')
+        self.assertEqual(self.service.registrations, 0, 'Adopting never registers')
+        self.assertNotIn(KEY, json.dumps(out))
+        self.assertEqual(agent.store.load()['api_key'], KEY)
+        again = agent.adopt(agent.existing_key())
+        self.assertTrue(again['already_adopted'])
+        self.assertEqual(agent.token(), 'tok-1', 'The adopted agent activates and takes part')
+
+    def test_the_older_key_file_name_is_found_too(self):
+        path = self.quickstart_key(name='api_key')
+        self.assertEqual(self.at_home().existing_key(), path)
+
+    def test_a_refused_key_is_not_kept(self):
+        self.quickstart_key(REVOKED)
+        agent = self.at_home()
+        with self.assertRaises(AgentError) as caught:
+            agent.adopt(agent.existing_key())
+        self.assertEqual(caught.exception.code, 'registration_refused')
+        self.assertNotIn(REVOKED, str(caught.exception))
+        self.assertEqual(agent.store.load(), {})
+
+    def test_a_file_that_is_not_a_key_is_refused_before_any_request(self):
+        path = self.quickstart_key('hello world')
+        with self.assertRaises(AgentError) as caught:
+            self.at_home().adopt(path)
+        self.assertEqual(caught.exception.code, 'not_an_agent_key')
+        self.assertEqual(self.service.calls, [])
+
+    def test_a_profile_with_another_agent_is_never_overwritten(self):
+        self.agent.register('Pi', 'Tests')
+        other = self.quickstart_key(REVOKED)
+        with self.assertRaises(AgentError) as caught:
+            self.agent.adopt(other)
+        self.assertEqual(caught.exception.code, 'profile_in_use')
+        self.assertEqual(self.store.load()['api_key'], KEY)
+
+    def test_a_second_profile_registers_its_own_agent(self):
+        self.quickstart_key()
+        agent = self.at_home(profile='second')
+        self.assertIsNone(agent.existing_key())
+        out, is_error = tools.run(agent, 'enfuse_connect', {'display_name': 'Pi two', 'description': 'Tests'})
+        self.assertFalse(is_error, out)
+        self.assertEqual(self.service.registrations, 1)
+        self.assertNotIn('adopted', out)
 
     def test_invalid_names_are_refused_before_any_request(self):
         with self.assertRaises(AgentError):

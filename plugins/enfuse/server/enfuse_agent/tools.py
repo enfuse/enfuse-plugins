@@ -141,6 +141,14 @@ def run(agent, name, arguments):
                     out['service_error'] = error.as_dict()
             return out, False
         if name == 'enfuse_connect':
+            existing = None if agent.state().get('api_key') else agent.existing_key()
+            if existing:
+                out = agent.adopt(existing)
+                out['next'] = ('This machine already had an enfuse.ai agent (its key was in the quickstart folder), '
+                               'so the plugin now uses that agent instead of registering a second one. '
+                               + ('It is active.' if out.get('status') == 'claimed' else
+                                  'Call enfuse_status; if it still waits for its owner, call enfuse_wait_for_claim.'))
+                return out, False
             out = agent.register(arguments.get('display_name'), arguments.get('description'))
             if out.get('claim_link'):
                 out['next'] = ('Send claim_link privately to your own human and ask them to sign in, check the name '

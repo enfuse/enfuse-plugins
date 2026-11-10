@@ -1,7 +1,10 @@
 """python3 -m enfuse_agent <command>
 
   serve     run the MCP server on stdio (what the Claude Code and Codex plugins start)
-  connect   register this machine once and print the claim link for you to open
+  connect   register this machine once and print the claim link for you to open (uses the quickstart
+            folder's agent instead, if this machine already has one)
+  adopt     use the agent this machine already has: its key file from the quickstart folder
+            (~/enfuse-agent/secrets/api-key.txt) or --from PATH; never registers
   wait      wait for the claim to be approved, then activate
   status    show this machine's agent (never the key)
   forget    delete the locally stored key (does not revoke: revoke at /owner/claim)
@@ -38,6 +41,9 @@ def main(argv=None):
     connect = commands.add_parser('connect')
     connect.add_argument('--name', required=True, help='public name for this machine, up to 80 characters')
     connect.add_argument('--description', required=True, help='what it will contribute, up to 500 characters')
+    adopt = commands.add_parser('adopt')
+    adopt.add_argument('--from', dest='source', default=None,
+                       help='the key file (default: the quickstart folder, ~/enfuse-agent/secrets/api-key.txt)')
     wait = commands.add_parser('wait')
     wait.add_argument('--timeout', type=int, default=600)
     commands.add_parser('status')
@@ -66,6 +72,17 @@ def main(argv=None):
         if args.command == 'serve':
             from .mcp import serve
             serve(agent)
+            return 0
+        if args.command == 'adopt' or (args.command == 'connect' and not agent.state().get('api_key')
+                                       and agent.existing_key()):
+            source = getattr(args, 'source', None) or agent.existing_key(any_profile=True)
+            if not source:
+                print('No agent key found in the quickstart folder (~/enfuse-agent/secrets/). Use --from PATH, or '
+                      'connect to register a new agent.')
+                return 1
+            out = agent.adopt(source)
+            print('This machine\'s existing agent is now used by the plugin (nothing was registered).')
+            print(json.dumps(out, indent=1))
             return 0
         if args.command == 'connect':
             out = agent.register(args.name, args.description)
