@@ -26,6 +26,7 @@ class Service:
     def __init__(self):
         self.calls, self.claimed, self.token_n, self.expire_next, self.limit_next = [], False, 0, False, False
         self.registrations, self.seen_ids = 0, {}
+        self.script = []  # scripted answers for community routes, oldest first
         self.agents = [dict(agent) for agent in Service.agents]
 
     def answer(self, method, path, headers, body):
@@ -68,6 +69,8 @@ class Service:
             if self.limit_next:
                 self.limit_next = False
                 return 429, {'error': 'rate_limited'}, {'Retry-After': '2'}
+            if self.script:
+                return self.script.pop(0)
             route = path.rsplit('/', 1)[1]
             if route == 'read':
                 if body.get('view') == 'permissions':
@@ -455,6 +458,201 @@ class AgentTests(unittest.TestCase):
         got = Client(self.server.base).request('GET', '/owner/terminal/v1/agents', bearer=OWNER_TOKEN)
         self.assertEqual(got.status, 302, 'Answered as the redirect itself, not followed')
 
+
+
+DAY = {'error': 'rate_limited', 'window': 'agent_content_day',
+       'detail': 'You have published 10 items in the last 24 hours.'}
+HOUR = {'error': 'rate_limited', 'window': 'agent_content_hour',
+        'detail': 'You have published 3 items in the last hour.'}
+EDGE_HTML = '<html><body>Error 522: connection timed out</body></html>'
+
+
+class RetryAfterTests(unittest.TestCase):
+    """Issue #961: honour the server's window and Retry-After; never resend a day-window 429 early."""
+    setUp, tearDown, sleep, mcp = AgentTests.setUp, AgentTests.tearDown, AgentTests.sleep, AgentTests.mcp
+
+    def ready(self, *script):
+        self.agent.register('Pi', 'Tests'); self.service.claimed = True; self.agent.activate()
+        self.service.script = list(script)
+
+    def sent(self, route):
+        return [c[3] for c in self.service.calls if c[1].endswith('/' + route)]
+
+    def deferred(self, route='posts', fields=None):
+        with self.assertRaises(AgentError) as caught:
+            self.agent.call(route, fields or {'title': 'T', 'body': 'B'})
+        return caught.exception.as_dict()
+
+    def assert_one_identical_resend(self, route='posts'):
+        bodies = self.sent(route)
+        self.assertEqual(len(bodies), 2)
+        self.assertEqual(bodies[0], bodies[1])
+        self.assertTrue(bodies[0]['request_id'].startswith('ea-'))
+
+    def test_hour_window_with_a_short_retry_after_resends_once_with_the_same_request_id(self):
+        self.ready((429, HOUR, {'Retry-After': '45'}))
+        self.assertEqual(self.agent.call('posts', {'title': 'T', 'body': 'B'})['outcome'], 'created')
+        self.assertEqual(self.slept, [45])
+        self.assert_one_identical_resend()
+
+    def test_hour_window_refused_again_after_the_resend_is_deferred_with_the_second_answer(self):
+        second = dict(HOUR, detail='Still full.')
+        self.ready((429, HOUR, {'Retry-After': '30'}), (429, second, {'Retry-After': '20'}))
+        out = self.deferred()
+        self.assertEqual(self.slept, [30])
+        self.assert_one_identical_resend()
+        self.assertEqual((out['window'], out['detail'], out['retry_after']), ('agent_content_hour', 'Still full.', 20))
+
+    def test_hour_window_with_a_long_retry_after_is_deferred_without_waiting(self):
+        self.ready((429, HOUR, {'Retry-After': '600'}))
+        out = self.deferred()
+        self.assertEqual(self.slept, [])
+        self.assertEqual(len(self.sent('posts')), 1)
+        self.assertEqual(out, {'error': 'rate_limited', 'status': 429, 'window': 'agent_content_hour',
+                               'detail': HOUR['detail'], 'retry_after': 600,
+                               'retry_not_before': '1970-01-01T00:26:40Z', 'deferred': True,
+                               'message': out['message'], 'http_status': 429})
+
+    def test_day_window_never_sleeps_or_resends_even_with_a_short_retry_after(self):
+        self.ready()
+        for retry_after in ('86400', '3600', '5'):
+            with self.subTest(retry_after=retry_after):
+                self.slept.clear(); self.service.calls.clear()
+                self.service.script = [(429, DAY, {'Retry-After': retry_after})]
+                out = self.deferred()
+                self.assertEqual(self.slept, [])
+                self.assertEqual(len(self.sent('posts')), 1)
+                self.assertEqual((out['error'], out['status'], out['window'], out['detail'], out['retry_after']),
+                                 ('rate_limited', 429, 'agent_content_day', DAY['detail'], int(retry_after)))
+                self.assertIn('take 1', out['message'])
+
+    def test_other_day_windows_name_only_that_kind_of_write(self):
+        self.ready((429, {'error': 'rate_limited', 'window': 'vote_day', 'detail': 'Vote limit.'},
+                    {'Retry-After': '7200'}))
+        out = self.deferred('votes', {'target_id': 'rec-1', 'value': 1})
+        self.assertEqual((out['window'], out['retry_after']), ('vote_day', 7200))
+        self.assertNotIn('vote', out['message'].replace('vote_day', ''))
+        self.assertNotIn('take 1', out['message'])
+        self.assertEqual(self.slept, [])
+
+    def test_day_window_retry_not_before_is_the_servers_own_time_in_utc(self):
+        self.now[0] = 1_795_000_000.0
+        self.ready((429, DAY, {'Retry-After': '86400'}))
+        self.assertEqual(self.deferred()['retry_not_before'], '2026-11-19T11:06:40Z')
+
+    def test_no_window_with_a_short_retry_after_resends_once(self):
+        self.ready((429, {'error': 'rate_limited'}, {'Retry-After': '0'}))
+        self.assertEqual(self.agent.call('posts', {'title': 'T', 'body': 'B'})['outcome'], 'created')
+        self.assertEqual(self.slept, [0])
+        self.assert_one_identical_resend()
+
+    def test_no_window_with_a_long_retry_after_is_deferred(self):
+        self.ready((429, {'error': 'rate_limited'}, {'Retry-After': '61'}))
+        out = self.deferred()
+        self.assertEqual(self.slept, [])
+        self.assertEqual((out['window'], out['retry_after']), (None, 61))
+
+    def test_missing_or_malformed_retry_after_is_reported_as_null_never_guessed(self):
+        self.ready()
+        for headers in ({}, {'Retry-After': 'soon'}, {'Retry-After': '-5'}, {'Retry-After': '1.5'},
+                        {'Retry-After': 'Wed, 21 Oct 2026 07:28:00 GMT'}, {'Retry-After': '1000000000000'},
+                        {'Retry-After': '604801'}, {'Retry-After': '9' * 5000}):
+            for data in ({'error': 'rate_limited'}, HOUR, DAY):
+                with self.subTest(header=headers.get('Retry-After', '')[:20], window=data.get('window')):
+                    self.slept.clear(); self.service.calls.clear()
+                    self.service.script = [(429, data, headers)]
+                    out = self.deferred()
+                    self.assertEqual(self.slept, [])
+                    self.assertEqual(len(self.sent('posts')), 1)
+                    self.assertIsNone(out['retry_after'])
+                    self.assertIsNone(out['retry_not_before'])
+                    self.assertEqual(out['window'], data.get('window'))
+
+    def test_a_week_is_the_longest_retry_after_kept(self):
+        self.ready((429, DAY, {'Retry-After': '604800'}))
+        self.assertEqual(self.deferred()['retry_after'], 604800)
+
+    def test_huge_retry_after_through_mcp_is_a_deferred_error_not_a_crash(self):
+        self.ready()
+        for value in ('1000000000000', '9' * 5000):
+            with self.subTest(digits=len(value)):
+                self.service.script = [(429, DAY, {'Retry-After': value})]
+                replies = self.mcp({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call', 'params': {
+                    'name': 'enfuse_post', 'arguments': {'title': 'T', 'body': 'B'}}})
+                self.assertNotIn('error', replies[0])
+                result = replies[0]['result']
+                self.assertTrue(result.get('isError'))
+                text = json.loads(result['content'][0]['text'])
+                self.assertEqual((text['window'], text['retry_after'], text['retry_not_before']),
+                                 ('agent_content_day', None, None))
+
+    def test_utc_iso_out_of_range_is_none(self):
+        from enfuse_agent.agent import utc_iso
+        self.assertIsNone(utc_iso(10 ** 13))
+        self.assertIsNone(utc_iso(10 ** 30))
+
+    def test_lowercase_retry_after_header_is_read(self):
+        self.ready((429, {'error': 'rate_limited'}, {'retry-after': '7'}))
+        self.agent.call('posts', {'title': 'T', 'body': 'B'})
+        self.assertEqual(self.slept, [7])
+
+    def test_503_with_retry_after_resends_once_and_without_it_stops(self):
+        busy = {'error': 'public_authoring_unavailable'}
+        self.ready((503, busy, {'Retry-After': '10'}))
+        self.agent.call('posts', {'title': 'T', 'body': 'B'})
+        self.assertEqual(self.slept, [10])
+        self.assert_one_identical_resend()
+        self.service.script = [(503, busy, {'Retry-After': '10'}), (503, busy, {'Retry-After': '10'})]
+        out = self.deferred()
+        self.assertEqual((out['error'], out['status'], out['retry_after']), ('public_authoring_unavailable', 503, 10))
+        self.service.script = [(503, busy, {'Retry-After': '900'})]
+        self.slept.clear()
+        self.assertEqual(self.deferred()['retry_after'], 900)
+        self.assertEqual(self.slept, [])
+        self.service.script = [(503, {'error': 'feature_disabled'})]
+        with self.assertRaises(AgentError) as caught:
+            self.agent.call('read', {'view': 'feed'})
+        self.assertEqual((caught.exception.code, caught.exception.status), ('feature_disabled', 503))
+        self.assertEqual(self.slept, [])
+
+    def test_edge_errors_on_a_read_wait_60_seconds_up_to_5_times(self):
+        self.ready(*[(status, EDGE_HTML) for status in (502, 521, 522, 523, 524)])
+        self.assertEqual(self.agent.call('read', {'view': 'feed'})['view'], 'feed')
+        self.assertEqual(self.slept, [60] * 5)
+        self.assertEqual(len(self.sent('read')), 6)
+
+    def test_edge_errors_on_a_read_stop_after_5_retries_within_300_seconds(self):
+        self.ready(*[(522, EDGE_HTML)] * 10)
+        with self.assertRaises(AgentError) as caught:
+            self.agent.call('read', {'view': 'feed'})
+        out = caught.exception.as_dict()
+        self.assertEqual(sum(self.slept), 300)
+        self.assertEqual(len(self.sent('read')), 6)
+        self.assertEqual((out['error'], out['status'], out['retry_after'], out['retry_not_before']),
+                         ('site_unavailable', 522, None, None))
+
+    def test_edge_errors_on_a_write_resend_once_with_the_same_request_id(self):
+        self.ready((524, EDGE_HTML))
+        self.assertEqual(self.agent.call('posts', {'title': 'T', 'body': 'B'})['outcome'], 'created')
+        self.assertEqual(self.slept, [60])
+        self.assert_one_identical_resend()
+        self.service.script = [(502, EDGE_HTML), (502, EDGE_HTML), (502, EDGE_HTML)]
+        self.slept.clear(); self.service.calls.clear()
+        out = self.deferred()
+        self.assertEqual(self.slept, [60])
+        self.assertEqual(out['status'], 502)
+        self.assertEqual(len(self.service.script), 1)
+        self.assert_one_identical_resend()
+
+    def test_mcp_tool_result_carries_the_servers_window_and_detail(self):
+        self.ready((429, DAY, {'Retry-After': '3600'}))
+        result, is_error = tools.run(self.agent, 'enfuse_post', {'title': 'T', 'body': 'B'})
+        self.assertTrue(is_error)
+        self.assertEqual((result['error'], result['status'], result['window'], result['detail'], result['retry_after']),
+                         ('rate_limited', 429, 'agent_content_day', DAY['detail'], 3600))
+        self.assertRegex(result['retry_not_before'], r'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$')
+        self.assertNotIn('120', result['message'])
+        self.assertEqual(self.slept, [])
 
 if __name__ == '__main__':
     unittest.main()
