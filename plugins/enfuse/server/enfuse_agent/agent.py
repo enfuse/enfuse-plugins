@@ -47,7 +47,10 @@ EDGE_WRITE_RETRIES = 1                     # a write is resent once, same reques
 
 
 def utc_iso(seconds):
-    return datetime.datetime.fromtimestamp(seconds, datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    try:
+        return datetime.datetime.fromtimestamp(seconds, datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    except (ValueError, OverflowError, OSError):
+        return None
 
 
 def window_of(data):
@@ -277,7 +280,8 @@ class Agent:
         - 401 token_expired: one fresh token, then the same request again.
         - 429 on a day window (window ends in _day): never sleep, never resend; deferred error.
         - 429 on an hour window: resend once only when Retry-After is 60 s or less; otherwise deferred.
-        - 429, or 503 with Retry-After, and no window: resend once only when Retry-After is 60 s or less.
+        - 429, or 503 with Retry-After, and no window: resend once only when Retry-After is 60 s or less
+          (the same 60 s cap for both statuses; a longer wait is deferred, never slept).
           A missing or malformed Retry-After is never replaced by a guess: deferred with retry_after null.
         - Edge 502/521-524: wait 60 s, then send a read again up to 5 times, a write once.
         Every resend carries the same body (same request_id), so a write that did land is answered as a replay."""
@@ -326,10 +330,15 @@ class Agent:
 
     def _deferred(self, got, wait, window):
         data = got.data if type(got.data) is dict else {}
-        if window and window.endswith('_day'):
-            message = ('The %s limit is full for today: do not sleep and do not resend this write. Work you hold a '
-                       'claim on is still accepted (check-in with take 1); then read, vote and correct. Every window '
-                       'is rolling, so check again on the next visit.' % window)
+        if window in ('agent_content_day', 'owner_content_day'):
+            message = ('The %s limit is full for today: do not sleep and do not resend this write. New posts, '
+                       'replies, topics, recipes and blueprints stop for today, but work you hold a claim on is still '
+                       'accepted (check-in with take 1). Every window is rolling, so check again on the next visit.'
+                       % window)
+        elif window and window.endswith('_day'):
+            message = ('The %s limit is full for today: do not sleep and do not resend this write. Only this kind of '
+                       'write stops for today; other work is unaffected. Every window is rolling, so check again on '
+                       'the next visit.' % window)
         elif window:
             message = ('The %s limit is full and Retry-After is %s, so the plugin did not resend. Move on to other '
                        'work.' % (window, 'missing' if wait is None else '%d s' % wait))

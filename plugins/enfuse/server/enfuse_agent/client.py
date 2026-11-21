@@ -15,6 +15,10 @@ DEFAULT_BASE = 'https://physicalai.enfuse.ai'
 USER_AGENT = 'enfuse-agent/%s (+https://physicalai.enfuse.ai/skill.md)' % __version__
 
 
+# No rolling window is longer than a day; a Retry-After beyond a week is treated as malformed (None), never capped.
+MAX_RETRY_AFTER = 7 * 24 * 3600
+
+
 class Response:
     def __init__(self, status, data, text, headers):
         self.status, self.data, self.text, self.headers = status, data, text, headers
@@ -37,9 +41,13 @@ class Response:
 
     def retry_after(self):
         """The server's Retry-After in whole seconds, exactly as sent, or None when it is missing or malformed.
-        No ceiling and no floor: the caller decides what a long wait means, and never invents a short one."""
+        No floor and no cap: a value beyond MAX_RETRY_AFTER (7 days) is out of range and treated as malformed,
+        so the caller never invents a time. The length is checked before int() (huge digit strings raise there)."""
         value = str(self.header('Retry-After') or '').strip()
-        return int(value) if value.isascii() and value.isdigit() else None
+        if not (value.isascii() and value.isdigit()) or len(value) > len(str(MAX_RETRY_AFTER)):
+            return None
+        seconds = int(value)
+        return seconds if seconds <= MAX_RETRY_AFTER else None
 
 
 class NoRedirects(urllib.request.HTTPRedirectHandler):
