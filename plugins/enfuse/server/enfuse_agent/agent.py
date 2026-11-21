@@ -3,8 +3,11 @@
 Follows the published guide (/skill.md) exactly: one registration, the claim link only to the
 owner, the registration key only on /agents/v1/status, /activate and /token, access tokens (at
 most five minutes) only on community routes and only in memory, and the guide's rules for 401,
-403, 429 and 503. Nothing here grants authority: the owner claims, pauses and revokes on the site.
+403, 429, 503 and edge 5xx. A full day window is never resent: the call returns a deferred error
+with the server's own window, detail and Retry-After. Nothing here grants authority: the owner
+claims, pauses and revokes on the site.
 """
+import datetime
 import os
 import secrets
 import time
@@ -33,6 +36,37 @@ class AgentError(Exception):
         if self.status:
             out['http_status'] = self.status
         return out
+
+
+# Rate limits and outages (skill.md, "Writes: what to do instead of retrying" and "When something goes wrong").
+SHORT_WAIT = 60                            # longest Retry-After the plugin waits out before its one resend
+EDGE_STATUSES = (502, 521, 522, 523, 524)  # the edge network answering while the site restarts
+EDGE_WAIT = 60                             # seconds between edge retries
+EDGE_READ_RETRIES = 5                      # a read is sent again up to 5 times (at most 300 s of waiting)
+EDGE_WRITE_RETRIES = 1                     # a write is resent once, same request_id (at most 60 s of waiting)
+
+
+def utc_iso(seconds):
+    return datetime.datetime.fromtimestamp(seconds, datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+def window_of(data):
+    window = data.get('window') if type(data) is dict else None
+    return window if type(window) is str and window else None
+
+
+class DeferredError(AgentError):
+    """The service refused for now and the plugin did not (or no longer) resend. Carries the server's own
+    error, window, detail and Retry-After, and the earliest time to try again (null when the server gave none)."""
+
+    def __init__(self, message, *, code, status, window, detail, retry_after, retry_not_before):
+        super().__init__(message, code=code, detail=detail, status=status)
+        self.window, self.retry_after, self.retry_not_before = window, retry_after, retry_not_before
+
+    def as_dict(self):
+        return {'error': self.code, 'status': self.status, 'window': self.window, 'detail': self.detail,
+                'retry_after': self.retry_after, 'retry_not_before': self.retry_not_before,
+                'deferred': True, 'message': str(self), 'http_status': self.status}
 
 
 class Agent:
@@ -238,23 +272,38 @@ class Agent:
                 'policy_revision': value['policy_revision']}
 
     def call(self, route, fields):
-        """One community request with the binding, a fresh request_id for writes, and the guide's retry rules:
-        a 401 token_expired gets one fresh token, a 429 or a 503 with Retry-After one wait; each resends the
-        same body (same request_id), so a write that did land is answered as a replay, never posted twice."""
+        """One community request with the binding, a fresh request_id for writes, and the guide's retry rules.
+
+        - 401 token_expired: one fresh token, then the same request again.
+        - 429 on a day window (window ends in _day): never sleep, never resend; deferred error.
+        - 429 on an hour window: resend once only when Retry-After is 60 s or less; otherwise deferred.
+        - 429, or 503 with Retry-After, and no window: resend once only when Retry-After is 60 s or less.
+          A missing or malformed Retry-After is never replaced by a guess: deferred with retry_after null.
+        - Edge 502/521-524: wait 60 s, then send a read again up to 5 times, a write once.
+        Every resend carries the same body (same request_id), so a write that did land is answered as a replay."""
         if route != 'read' and route not in WRITES:
             raise AgentError('Unknown community route %r.' % route, code='unknown_route')
         body = dict(fields)
         body.update(self.binding())
         if route != 'read':
             body.setdefault('request_id', 'ea-' + secrets.token_hex(12))
-        token, retried = self.token(), set()
+        token, retried, edge_tries = self.token(), set(), 0
+        edge_retries = EDGE_READ_RETRIES if route == 'read' else EDGE_WRITE_RETRIES
         while True:
             got = self.client.request('POST', PUBLIC + route, body, bearer=token)
             if got.status == 401 and got.error == 'token_expired' and 'token' not in retried:
                 retried.add('token'); token = self.token(fresh=True); continue
-            wait = got.retry_after()
-            if got.status in (429, 503) and wait and 'wait' not in retried:
-                retried.add('wait'); self.sleep(wait); continue
+            if got.status in EDGE_STATUSES and edge_tries < edge_retries:
+                edge_tries += 1; self.sleep(EDGE_WAIT); continue
+            if got.status in (429, 503):
+                wait, window = got.retry_after(), window_of(got.data)
+                if got.status == 503 and wait is None and window is None:
+                    break  # the feature is off on this deployment: stop using it
+                short = wait is not None and wait <= SHORT_WAIT
+                resendable = window is None or window.endswith('_hour')
+                if short and resendable and 'wait' not in retried:
+                    retried.add('wait'); self.sleep(wait); continue
+                raise self._deferred(got, wait, window)
             break
         data = got.data if type(got.data) is dict else {}
         if got.ok:
@@ -262,12 +311,37 @@ class Agent:
         if got.status == 403:
             raise AgentError('Refused (403): the agent\'s authority changed (paused, revoked, policy or key) or the '
                              'request was declined. Stop and tell your human.', code='request_denied', status=403)
-        if got.status == 429:
-            raise AgentError('Publishing limit reached for now.', code='rate_limited', status=429,
-                             detail='Wait %s seconds before publishing again; reading, voting and editing still work.'
-                                    % (wait or 'some'))
+        if got.status in EDGE_STATUSES:
+            wait = got.retry_after()
+            raise DeferredError('The site is restarting: edge %s on %d tries over %d seconds. On a later visit, read '
+                                'the current state before writing again.' % (got.status, edge_tries + 1,
+                                                                             edge_tries * EDGE_WAIT),
+                                code=data.get('error') or 'site_unavailable', status=got.status, window=None,
+                                detail=data.get('detail'), retry_after=wait, retry_not_before=self._not_before(wait))
         raise AgentError(data.get('detail') or 'The service refused this request.', code=data.get('error') or 'refused',
                          detail=data.get('detail'), status=got.status)
+
+    def _not_before(self, wait):
+        return utc_iso(self.clock() + wait) if wait is not None else None
+
+    def _deferred(self, got, wait, window):
+        data = got.data if type(got.data) is dict else {}
+        if window and window.endswith('_day'):
+            message = ('The %s limit is full for today: do not sleep and do not resend this write. Work you hold a '
+                       'claim on is still accepted (check-in with take 1); then read, vote and correct. Every window '
+                       'is rolling, so check again on the next visit.' % window)
+        elif window:
+            message = ('The %s limit is full and Retry-After is %s, so the plugin did not resend. Move on to other '
+                       'work.' % (window, 'missing' if wait is None else '%d s' % wait))
+        elif got.status == 503:
+            message = 'The public store is busy or briefly unreachable, so the plugin did not resend.'
+        else:
+            message = 'Too many requests arrived at once, so the plugin did not resend.'
+        if wait is None:
+            message += ' The service sent no usable Retry-After, so no retry time is given.'
+        return DeferredError(message, code=data.get('error') or ('rate_limited' if got.status == 429 else 'unavailable'),
+                             status=got.status, window=window, detail=data.get('detail'), retry_after=wait,
+                             retry_not_before=self._not_before(wait))
 
     def permissions(self):
         return self.call('read', {'view': 'permissions', 'include': ['owner_note']})

@@ -27,11 +27,19 @@ class Response:
     def error(self):
         return self.data.get('error') if type(self.data) is dict else None
 
-    def retry_after(self, ceiling=120):
-        try:
-            return max(1, min(ceiling, int(self.headers.get('Retry-After', ''))))
-        except (TypeError, ValueError):
-            return None
+    def header(self, name):
+        """A response header by name, whatever its case (None when absent)."""
+        name = name.lower()
+        for key, value in (self.headers or {}).items():
+            if str(key).lower() == name:
+                return value
+        return None
+
+    def retry_after(self):
+        """The server's Retry-After in whole seconds, exactly as sent, or None when it is missing or malformed.
+        No ceiling and no floor: the caller decides what a long wait means, and never invents a short one."""
+        value = str(self.header('Retry-After') or '').strip()
+        return int(value) if value.isascii() and value.isdigit() else None
 
 
 class NoRedirects(urllib.request.HTTPRedirectHandler):
