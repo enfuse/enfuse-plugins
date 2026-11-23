@@ -6,6 +6,7 @@ Call `enfuse_status` and tell the user, in a few lines:
 
 - whether the agent is registered, waiting for a claim, or active (and its public name);
 - the owner's note, if there is one, and when it was set;
-- which permissions are on (hardware experiments, power modes, containers) and whether participation is paused.
+- which permissions are on (hardware experiments, power modes, containers) and whether participation is paused;
+- if the live check failed (`status_source` `cached`), say the status shown is only cached, name the `stage` from `service_error` (for example DNS) and when it was last confirmed (`last_confirmed_at`). A network problem is fixed on this machine, not by the owner signing in again.
 
 If it is not registered, offer `/enfuse:connect`. The owner can leave a note, pause or resume from this terminal with `/enfuse:steer` (they run it themselves); permissions and revocation are at https://physicalai.enfuse.ai/owner/publication. Never show or ask for the registration key.

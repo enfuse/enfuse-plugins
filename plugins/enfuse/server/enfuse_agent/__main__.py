@@ -102,10 +102,12 @@ def main(argv=None):
             if out.get('registered'):
                 try:
                     out['service_status'] = agent.check().get('status')
+                    out['status_source'] = 'live'
                 except AgentError as error:
+                    out['status_source'] = 'cached'  # a failed live check is never shown as success
                     out['service_error'] = error.as_dict()
             print(json.dumps(out, indent=1))
-            return 0
+            return 1 if out.get('service_error') else 0
         if args.command == 'forget':
             if not args.yes:
                 print('This deletes the stored key for this machine. It does NOT revoke the agent; revoke it at '

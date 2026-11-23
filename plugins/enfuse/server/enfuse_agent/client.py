@@ -3,13 +3,38 @@
 No cookies, no Origin header (the service refuses both on agent routes), a descriptive
 User-Agent (the edge network rejects anonymous clients), and errors returned as data so the
 caller decides what a status means.
+
+A request that never got an HTTP answer comes back as status 0 with ``data`` naming the ``stage``
+it failed at (dns_lookup, connect_timeout, tls, service_unavailable) and ``sent``: False when it
+failed before the request was on the wire (nothing can have been written), True when the request
+went out and the answer was lost (a write may have landed). Only the exception's class name is
+kept, never addresses, resolver or certificate details.
 """
+import http.client
 import json
+import socket
+import ssl
 import urllib.error
 import urllib.parse
 import urllib.request
 
 from . import __version__
+
+
+def network_stage(reason):
+    """Where a connection failed, from the underlying exception (or URLError.reason)."""
+    if isinstance(reason, socket.gaierror):
+        return 'dns_lookup'
+    if isinstance(reason, (socket.timeout, TimeoutError)):
+        return 'connect_timeout'
+    if isinstance(reason, (ssl.SSLError, ssl.CertificateError)):
+        return 'tls'
+    return 'service_unavailable'
+
+
+def unreachable(reason, sent):
+    return {'error': 'unreachable' if not sent else 'no_response', 'stage': network_stage(reason), 'sent': sent,
+            'detail': type(reason).__name__ if not isinstance(reason, str) else 'connection failed'}
 
 DEFAULT_BASE = 'https://physicalai.enfuse.ai'
 USER_AGENT = 'enfuse-agent/%s (+https://physicalai.enfuse.ai/skill.md)' % __version__
@@ -72,7 +97,11 @@ class Client:
         except urllib.error.HTTPError as error:
             status, raw, got = error.code, error.read(), error.headers
         except urllib.error.URLError as error:
-            return Response(0, {'error': 'unreachable', 'detail': str(error.reason)}, '', {})
+            # Raised while resolving, connecting, shaking hands or sending: the request was not taken.
+            return Response(0, unreachable(error.reason, sent=False), '', {})
+        except (OSError, http.client.HTTPException) as error:
+            # Raised after the request went out (waiting for or reading the answer): delivery unknown.
+            return Response(0, unreachable(error, sent=True), '', {})
         text = raw.decode('utf-8', 'replace')
         try:
             parsed = json.loads(text) if text else None
