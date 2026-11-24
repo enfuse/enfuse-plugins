@@ -1,18 +1,23 @@
 """Readiness (enfuse_status action reply) and recoverable replies, against the fake service with a fake identity."""
+import contextlib
 import http.client
+import io
 import json
 import os
 import socket
 import ssl
 import stat
 import tempfile
+import threading
 import unittest
 import urllib.error
+from unittest import mock
 
 from test_enfuse_agent import KEY, FakeServer, Service
 
-from enfuse_agent import tools
-from enfuse_agent.agent import Agent
+from enfuse_agent import __main__ as cli
+from enfuse_agent import publish, tools
+from enfuse_agent.agent import Agent, AgentError
 from enfuse_agent.client import Client
 from enfuse_agent.store import Store
 
@@ -32,6 +37,9 @@ class PublishService(Service):
         self.records = {}                 # request_id -> record
         self.quota_after = None           # refuse new records once this many exist
         self.visibility = 'public'
+        self.decision = None              # overrides what view can decides
+        self.thread_status = None         # an error status for view thread
+        self.reply_status = None          # an error status for replies, after the record is taken
 
     def writes(self):
         return [c for c in self.calls if c[1].endswith('/replies')]
@@ -46,13 +54,15 @@ class PublishService(Service):
             if view == 'permissions':
                 return 200, {'participation': {'state': self.participation}, 'owner_note': None}
             if view == 'thread':
+                if self.thread_status:
+                    return self.thread_status, {'error': 'not_found' if self.thread_status == 404 else 'invalid_id'}
                 if self.withdrawn:
                     return 200, {'context': None, 'items': []}
                 return 200, {'context': {'id': body['id'], 'revision': self.revision}, 'items': []}
             if view == 'can':
                 if not self.new_views:
                     return 400, {'error': 'invalid_view', 'detail': 'Unknown view.'}
-                ready = self.reason == 'claimed_active'
+                ready = self.reason == 'claimed_active' if self.decision is None else self.decision == 'ready'
                 window = {'name': 'agent_content_hour', 'limit': 10, 'retry_after': 900,
                           'retry_at': 1900} if self.reason == 'quota' else None
                 return 200, {'context': {'kind': 'reply_readiness', 'decision': 'ready' if ready else 'blocked',
@@ -79,6 +89,8 @@ class PublishService(Service):
                 return 429, {'error': 'rate_limited', 'window': 'agent_content_hour'}
             self.records[rid] = {'record_id': 'rec-%d' % (len(self.records) + 1),
                                  'kind': 'report' if body.get('verification') else 'reply'}
+            if self.reply_status:
+                return self.reply_status, {'error': 'bad_gateway'}
             return 200, {'outcome': 'created', 'record_id': self.records[rid]['record_id'], 'replayed': False}
         return 404, {'error': 'not_found'}
 
@@ -228,6 +240,25 @@ class PublishTests(unittest.TestCase):
         out, _ = self.status()
         self.assertEqual(out['stage'], 'topic_withdrawn')
 
+    def test_an_older_site_reports_a_missing_or_invalid_thread_as_such_not_as_a_network_failure(self):
+        self.claimed()
+        self.service.new_views = False
+        for status, stage in ((404, 'topic_withdrawn'), (400, 'invalid_id')):
+            self.service.thread_status = status
+            out, failed = self.status()
+            self.assertFalse(failed, 'The service answered: this is not a network failure')
+            self.assertEqual((out['decision'], out['stage'], out['live_permission']), ('blocked', stage, 'confirmed'))
+            self.assertFalse(out['owner_sign_in_needed'])
+            self.assertTrue(out['next_action'])
+        self.assertEqual(self.service.writes(), [])
+
+    def test_claimed_active_but_not_ready_is_a_gate_never_ok(self):
+        self.claimed()
+        self.service.decision = 'blocked'
+        out, failed = self.status()
+        self.assertEqual((out['decision'], out['stage']), ('blocked', 'gates'))
+        self.assertFalse(failed)
+
     # ---- recoverable replies ---------------------------------------------------------------------------------------
 
     def test_a_reply_is_journaled_without_secrets_and_created_with_link_and_visibility(self):
@@ -345,6 +376,187 @@ class PublishTests(unittest.TestCase):
         self.assertFalse(failed)
         self.assertEqual(out['results'][0]['state'], 'created')
         self.assertEqual(len(self.service.writes()), 1)
+
+    def journaled_not_sent(self, **extra):
+        self.agent.client.open = failing(socket.gaierror(-3, 'x'))
+        out, _ = self.reply(**extra)
+        self.assertEqual(out['outcome'], 'not_sent')
+        self.agent.client.open = self.real_open
+        return out
+
+    def adopt_another_identity(self):
+        value = self.store.load()
+        value['enrollment_id'] = 'enr-other'  # what forget + a new registration or adopting another key leaves
+        self.store.save(value)
+
+    def test_a_draft_from_another_identity_is_stale_and_never_sent(self):
+        self.claimed()
+        out = self.journaled_not_sent()
+        self.adopt_another_identity()
+        resumed, failed = tools.run(self.agent, 'enfuse_drafts', {'action': 'resume'})
+        self.assertTrue(failed)
+        self.assertEqual(resumed['results'][0]['state'], 'stale')
+        self.assertEqual(resumed['results'][0]['error']['error'], 'identity_changed')
+        self.assertEqual(self.service.writes(), [], 'Never posted as the new agent')
+        tools.run(self.agent, 'enfuse_drafts', {'action': 'resume', 'request_id': out['request_id']})
+        self.assertEqual(self.service.writes(), [], 'Still never sent on a second resume')
+        # A crash mid-send, then a new identity: neither the replay nor the receipt goes out as the new agent.
+        journal = publish.Journal(self.agent)
+        draft = journal.get(out['request_id'])
+        draft['state'] = 'pending'
+        journal.put(draft)
+        resumed, _ = tools.run(self.agent, 'enfuse_drafts', {'action': 'resume'})
+        self.assertEqual(resumed['results'][0]['state'], 'stale')
+        self.assertEqual(self.service.writes(), [])
+
+    def test_reply_never_resends_a_journaled_draft_of_another_identity(self):
+        self.claimed()
+        out = self.journaled_not_sent()
+        journal = publish.Journal(self.agent)
+        draft = journal.get(out['request_id'])
+        draft['enrollment_id'] = 'enr-someone-else'  # a journal entry whose identity does not match this machine
+        journal.put(draft)
+        again, failed = self.reply()
+        self.assertTrue(failed)
+        self.assertEqual((again['outcome'], again['error']['error']), ('stale', 'identity_changed'))
+        self.assertIn('never sent', again['next_action'])
+        self.assertEqual(self.service.writes(), [])
+
+    def test_forget_moves_the_drafts_file_aside(self):
+        self.claimed()
+        out = self.journaled_not_sent()
+        with mock.patch.dict(os.environ, {'ENFUSE_AGENT_HOME': self.store.directory}), \
+                contextlib.redirect_stdout(io.StringIO()) as printed:
+            code = cli.main(['--base', self.server.base, 'forget', '--yes'])
+        self.assertEqual(code, 0)
+        self.assertFalse(os.path.exists(self.store.path))
+        self.assertFalse(os.path.exists(out['drafts_file']), 'The next identity starts with no drafts')
+        archived = [n for n in os.listdir(os.path.dirname(out['drafts_file'])) if '.forgotten-' in n]
+        self.assertEqual(len(archived), 1)
+        self.assertIn('moved aside', printed.getvalue())
+        listed, _ = tools.run(self.agent, 'enfuse_drafts', {})
+        self.assertEqual(listed['totals']['total'], 0)
+
+    def test_a_replay_that_fails_before_sending_stays_resumable(self):
+        self.claimed()
+        self.service.new_views = False  # no receipt for replies: the lost answer gets the one replay
+        calls = [0]
+
+        def open_(request, timeout=None):
+            if request.full_url.endswith('/replies'):
+                calls[0] += 1
+                if calls[0] == 1:  # the service takes the first send, its answer is lost
+                    response = self.real_open(request, timeout=timeout)
+                    response.read(); response.close()
+                    raise http.client.RemoteDisconnected('Remote end closed connection without response')
+                raise urllib.error.URLError(socket.gaierror(-3, 'x'))  # the replay never leaves this machine
+            return self.real_open(request, timeout=timeout)
+        self.agent.client.open = open_
+        out, failed = self.reply()
+        self.assertTrue(failed)
+        self.assertEqual((out['outcome'], out['replays']), ('not_sent', 0), 'Not unresolved: the replay never went out')
+        self.assertEqual(out['error']['delivery'], 'not_sent')
+        self.assertEqual(out['totals']['unsent'], 1)
+        self.agent.client.open = self.real_open
+        resumed, failed = tools.run(self.agent, 'enfuse_drafts', {'action': 'resume'})
+        self.assertFalse(failed)
+        self.assertEqual(resumed['results'][0]['state'], 'created')
+        self.assertEqual(len(self.service.records), 1, 'At most one copy')
+
+    def test_a_replay_refused_by_quota_waits_for_the_window(self):
+        self.claimed()
+        self.service.new_views = False
+        self.lose_reply_answers(1)
+        real = self.service.answer
+        self.service.answer = lambda method, path, headers, body: (
+            (429, {'error': 'rate_limited', 'window': 'agent_content_hour'}) if path.endswith('/replies')
+            and self.service.writes() else real(method, path, headers, body))
+        out, failed = self.reply()
+        self.assertTrue(failed)
+        self.assertEqual((out['outcome'], out['replays']), ('quota', 0))
+
+    def test_a_502_or_524_on_a_write_is_delivery_unknown(self):
+        self.claimed()
+        for status in (502, 524):
+            self.service.reply_status = status
+            with self.assertRaises(AgentError) as caught:
+                self.agent.call('replies', {'post_id': POST, 'body': 'Status %d.' % status})
+            self.assertEqual((caught.exception.delivery, caught.exception.status), ('unknown', status))
+        self.service.reply_status = 502
+        out, failed = self.reply()
+        self.assertFalse(failed)
+        self.assertEqual(out['outcome'], 'created', 'The receipt finds the write the 502 hid')
+        self.assertEqual(len(self.service.writes()), 3, 'No replay once the receipt confirms it')
+
+    def test_an_error_answer_cut_off_mid_body_is_delivery_unknown(self):
+        self.claimed()
+
+        class CutOff(io.RawIOBase):
+            def read(self, *args):
+                raise http.client.IncompleteRead(b'{"err')
+
+        def open_(request, timeout=None):
+            response = self.real_open(request, timeout=timeout)
+            if request.full_url.endswith('/replies'):
+                response.read(); response.close()  # the service took it
+                raise urllib.error.HTTPError(request.full_url, 502, 'Bad Gateway', {}, CutOff())
+            return response
+        self.agent.client.open = open_
+        got = self.agent.client.request('POST', '/agent/public-community/v1/replies',
+                                        {'post_id': POST, 'request_id': 'ea-cut'})
+        self.assertEqual((got.status, got.data['sent'], got.data['stage']), (0, True, 'service_unavailable'))
+        with self.assertRaises(AgentError) as caught:
+            self.agent.call('replies', {'post_id': POST, 'body': 'Cut off.'})
+        self.assertEqual(caught.exception.delivery, 'unknown')
+        out, failed = self.reply()
+        self.assertFalse(failed)
+        self.assertEqual(out['outcome'], 'created')
+
+    def test_discard_drops_one_draft_and_refuses_an_unknown_id(self):
+        self.claimed()
+        out = self.journaled_not_sent()
+        self.journaled_not_sent(body='Another one.')
+        dropped, failed = tools.run(self.agent, 'enfuse_drafts', {'action': 'discard', 'request_id': out['request_id']})
+        self.assertFalse(failed)
+        self.assertEqual(dropped['discarded'], out['request_id'])
+        self.assertEqual(dropped['totals']['total'], 1)
+        listed, _ = tools.run(self.agent, 'enfuse_drafts', {})
+        self.assertNotIn(out['request_id'], [d['request_id'] for d in listed['drafts']])
+        again, failed = tools.run(self.agent, 'enfuse_drafts', {'action': 'discard', 'request_id': out['request_id']})
+        self.assertTrue(failed)
+        self.assertEqual(again['error'], 'no_such_draft')
+        tools.run(self.agent, 'enfuse_drafts', {'action': 'resume'})
+        self.assertEqual(len(self.service.writes()), 1, 'Only the kept draft is sent')
+
+    @unittest.skipIf(publish.fcntl is None, 'no fcntl: the journal is documented as unlocked here')
+    def test_concurrent_journal_writers_lose_no_drafts(self):
+        self.claimed()
+        errors = []
+
+        def writer(n):
+            try:
+                journal = publish.Journal(self.agent)  # its own lock handle, as another process would have
+                for i in range(15):
+                    journal.put({'id': 'd-%d-%d' % (n, i), 'state': 'not_sent'})
+            except Exception as error:  # pragma: no cover - reported below
+                errors.append(error)
+        threads = [threading.Thread(target=writer, args=(n,)) for n in range(6)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(errors, [])
+        journal = publish.Journal(self.agent)
+        self.assertEqual(len(journal.load()), 90, 'Every put survives')
+        if os.name == 'posix':
+            self.assertEqual(stat.S_IMODE(os.stat(journal.path + '.lock').st_mode) & 0o077, 0)
+
+    def test_the_journal_works_without_fcntl(self):
+        self.claimed()
+        with mock.patch.object(publish, 'fcntl', None):
+            out, failed = self.reply()
+            self.assertEqual(out['outcome'], 'created')
+            self.assertFalse(os.path.exists(out['drafts_file'] + '.lock'))
 
     def test_schemas_advertise_the_new_views_and_parameters(self):
         schemas = {tool['name']: tool['inputSchema']['properties'] for tool in tools.TOOLS}

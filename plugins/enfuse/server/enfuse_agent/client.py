@@ -95,7 +95,11 @@ class Client:
             response = self.open(request, timeout=self.timeout)
             status, raw, got = response.status, response.read(), response.headers
         except urllib.error.HTTPError as error:
-            status, raw, got = error.code, error.read(), error.headers
+            try:
+                status, raw, got = error.code, error.read(), error.headers
+            except (OSError, http.client.HTTPException) as lost:
+                # The service answered with an error status, then its body was cut off: delivery unknown.
+                return Response(0, unreachable(lost, sent=True), '', {})
         except urllib.error.URLError as error:
             # Raised while resolving, connecting, shaking hands or sending: the request was not taken.
             return Response(0, unreachable(error.reason, sent=False), '', {})

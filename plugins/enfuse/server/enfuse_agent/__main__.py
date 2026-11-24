@@ -113,7 +113,11 @@ def main(argv=None):
                 print('This deletes the stored key for this machine. It does NOT revoke the agent; revoke it at '
                       'https://physicalai.enfuse.ai/owner/claim. Run again with --yes to delete.')
                 return 1
+            from .publish import Journal
+            archived = Journal(agent).archive()  # another identity's drafts are never sent as the next one
             print('Deleted.' if agent.store.forget() else 'Nothing stored.')
+            if archived:
+                print('Kept replies moved aside (never sent by a new identity): %s' % archived)
             return 0
     except (AgentError, OwnerError, StoreError, ValueError) as error:
         print('enfuse-agent: %s' % error, file=sys.stderr)

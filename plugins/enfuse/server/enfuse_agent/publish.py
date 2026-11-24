@@ -17,11 +17,24 @@ identity always carries one request_id. Each draft ends in one of:
   it passes.
 - unresolved: the answer was lost, the receipt could not confirm it and the one identical replay failed too.
   Nothing is ever sent again for it; only its receipt is read.
-- stale: on resume, the discussion changed (its revision is newer than the one reviewed); re-read it first.
+- stale: on resume, the discussion changed (its revision is newer than the one reviewed); re-read it first. A
+  draft journaled by another identity (after ``forget`` and a new registration, or after adopting another key) is
+  stale too and is never sent: it would be posted as an agent that did not write it.
+
+The journal is read, changed and written under an exclusive ``fcntl.flock`` on a sidecar lock file
+(``drafts/<profile>.json.lock``), so two connector processes on one profile do not lose each other's drafts.
+Where ``fcntl`` is unavailable (Windows) there is no cross-process lock: run one connector per profile there.
+``forget`` archives the drafts file (``<profile>.json.forgotten-<time>``) so the next identity starts empty.
 """
+import contextlib
 import hashlib
 import json
 import os
+
+try:
+    import fcntl
+except ImportError:  # not POSIX: the journal is unlocked (see above)
+    fcntl = None
 
 from .agent import AgentError, utc_iso
 from .store import Store
@@ -48,6 +61,7 @@ NEXT = {
     'quota': 'A publishing window is full: keep your draft and send it after the window passes (enfuse_drafts resume).',
     'topic_withdrawn': 'This discussion was withdrawn or is not public: do not reply to it.',
     'gates': 'The site would refuse this reply for now: read body_checks and fix what they name.',
+    'invalid_id': 'The site refused that discussion id: check the id (enfuse_read view feed) and check again.',
 }
 STATES = ('created', 'not_sent', 'quota', 'unresolved', 'stale', 'pending')
 KEEP = 500
@@ -105,8 +119,10 @@ def readiness(agent, action='reply', target_id=None):
                 return result
             context = None  # a site without the readiness view (before release -203): fall back below
     if context and context.get('kind') == 'reply_readiness':
-        stage = REASONS.get(context.get('reason'), 'gates')
         ready = context.get('decision') == 'ready'
+        stage = REASONS.get(context.get('reason'), 'gates')
+        if stage == 'ok' and not ready:  # claimed and active, yet the site says no: a gate decides it
+            stage = 'gates'
         live = 'denied' if stage in ('pending_claim', 'paused', 'suspended') else 'confirmed'
         extra = {'reason': context.get('reason'), 'site_message': context.get('message'),
                  'window': context.get('window'), 'body_checks': context.get('body_checks') or [],
@@ -121,8 +137,16 @@ def readiness(agent, action='reply', target_id=None):
     # Fallback: the owner's participation settings, and whether the discussion is still there.
     try:
         participation = agent.permissions().get('participation') or {}
+    except AgentError as error:
+        return failed(error) or done('unknown', 'service_unavailable', 'unknown', live_error=error.as_dict())
+    try:
         thread = agent.call('read', {'view': 'thread', 'id': target_id}) if target_id else {}
     except AgentError as error:
+        if error.status == 404:  # the service answered: there is no such public discussion
+            return done('blocked', 'topic_withdrawn', 'confirmed', readiness_source='permissions',
+                        live_error=error.as_dict())
+        if error.status == 400:
+            return done('blocked', 'invalid_id', 'confirmed', readiness_source='permissions', live_error=error.as_dict())
         return failed(error) or done('unknown', 'service_unavailable', 'unknown', live_error=error.as_dict())
     state_word = participation.get('state') if type(participation) is dict else None
     if state_word in ('paused', 'paused_by_owner') or (type(participation) is dict and participation.get('paused')):
@@ -148,6 +172,25 @@ class Journal:
         profile = os.path.basename(agent.store.path)[:-len('.json')]
         self.store = Store(os.path.join(agent.store.directory, 'drafts'), profile)
         self.path = self.store.path
+        self._held = False
+
+    @contextlib.contextmanager
+    def locked(self):
+        """An exclusive lock on the journal across processes (POSIX); re-entrant within this Journal."""
+        if fcntl is None or self._held:
+            yield
+            return
+        os.makedirs(self.store.directory, mode=0o700, exist_ok=True)
+        handle = os.open(self.path + '.lock', os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            self._held = True
+            try:
+                yield
+            finally:
+                self._held = False
+        finally:
+            os.close(handle)  # closing releases the lock
 
     def load(self):
         drafts = self.store.load().get('drafts')
@@ -158,14 +201,35 @@ class Journal:
             done = [d for d in drafts if d.get('state') == 'created' and d.get('visibility') == 'public']
             drop = {id(d) for d in done[:len(drafts) - KEEP]}
             drafts = [d for d in drafts if id(d) not in drop]
-        self.store.save({'drafts': drafts})
+        with self.locked():
+            self.store.save({'drafts': drafts})
 
     def put(self, draft):
-        drafts = [d for d in self.load() if d.get('id') != draft['id']]
-        draft['updated_at'] = utc_iso(self.agent.clock())
-        drafts.append(draft)
-        self.save(drafts)
+        with self.locked():
+            drafts = [d for d in self.load() if d.get('id') != draft['id']]
+            draft['updated_at'] = utc_iso(self.agent.clock())
+            drafts.append(draft)
+            self.save(drafts)
         return draft
+
+    def remove(self, draft_id):
+        """Drop one draft; returns the drafts left, or None when no draft has that id."""
+        with self.locked():
+            drafts = self.load()
+            kept = [d for d in drafts if d.get('id') != draft_id]
+            if len(kept) == len(drafts):
+                return None
+            self.save(kept)
+        return kept
+
+    def archive(self):
+        """Move the drafts file aside (after forget); returns the archive path, or None when there was none."""
+        with self.locked():
+            if not os.path.exists(self.path):
+                return None
+            target = '%s.forgotten-%d' % (self.path, int(self.agent.clock()))
+            os.replace(self.path, target)
+            return target
 
     def get(self, draft_id):
         return next((d for d in self.load() if d.get('id') == draft_id), None)
@@ -226,6 +290,18 @@ def _created(agent, draft, record_id=None, receipt=None):
     return draft
 
 
+def _identity_changed(agent, draft):
+    """True when this draft was journaled by another identity than the one now on this machine."""
+    return draft.get('enrollment_id') != agent.state().get('enrollment_id')
+
+
+def _stale_identity(agent, draft):
+    draft.update(state='stale', error={'error': 'identity_changed', 'message': 'This draft was written by enrollment '
+                                       '%s; this machine is now %s. It is never sent as another agent.'
+                                       % (draft.get('enrollment_id'), agent.state().get('enrollment_id'))})
+    return draft
+
+
 def _failed(agent, draft, error):
     if error.stage == 'quota':
         wait = error.retry_after
@@ -241,6 +317,8 @@ def _failed(agent, draft, error):
 
 def _send(agent, journal, draft):
     """Send one journaled draft and settle its outcome. A lost answer gets the receipt, else one identical replay."""
+    if _identity_changed(agent, draft):
+        return journal.put(_stale_identity(agent, draft))
     body = dict(draft['fields'], request_id=draft['id'])
     draft['state'] = 'pending'
     journal.put(draft)
@@ -259,13 +337,18 @@ def _recover(agent, journal, draft):
     if (draft.get('replays') or 0) >= 1:
         draft.update(state='unresolved')
         return draft
+    if _identity_changed(agent, draft):
+        return _stale_identity(agent, draft)
     draft['replays'] = 1
     journal.put(draft)
     try:
         return _created(agent, draft, agent.call('replies', dict(draft['fields'], request_id=draft['id'])).get('record_id'))
     except AgentError as error:
-        draft.update(state='unresolved', error=error.as_dict())
-        return draft
+        if error.delivery == 'unknown':  # the replay went out and its answer was lost too: never again
+            draft.update(state='unresolved', error=error.as_dict())
+            return draft
+        draft['replays'] = 0  # the replay never reached the service (or it refused): the draft can be resumed
+        return _failed(agent, draft, error)
 
 
 OUTCOME_NEXT = {
@@ -277,6 +360,8 @@ OUTCOME_NEXT = {
     'stale': 'The discussion changed since you reviewed it. Read it again (enfuse_read view thread) and send a fresh '
              'reply with the new revision if it still fits.',
 }
+IDENTITY_NEXT = ('This draft was written by another identity on this machine; it is never sent. Discard it '
+                 '(enfuse_drafts discard) and write a fresh reply as this agent if it still fits.')
 
 
 def reply(agent, fields, revision=None):
@@ -292,7 +377,9 @@ def reply(agent, fields, revision=None):
                                  'created_at': utc_iso(agent.clock())}
     if revision is not None:
         draft['revision'] = revision
-    if draft.get('state') == 'created':
+    if draft.get('state') != 'created' and _identity_changed(agent, draft):
+        draft = journal.put(_stale_identity(agent, draft))
+    elif draft.get('state') == 'created':
         pass  # the same body from the same identity: already published, never sent twice
     elif draft.get('state') == 'pending':
         draft = journal.put(_recover(agent, journal, draft))
@@ -313,7 +400,8 @@ def reply(agent, fields, revision=None):
 def _result(journal, draft):
     out = _public(draft)
     out['outcome'] = draft['state']
-    out['next_action'] = OUTCOME_NEXT.get(draft['state'])
+    out['next_action'] = (IDENTITY_NEXT if (draft.get('error') or {}).get('error') == 'identity_changed'
+                          else OUTCOME_NEXT.get(draft['state']))
     out['totals'] = totals(journal.load())
     out['drafts_file'] = journal.path
     return out, draft['state'] != 'created'
@@ -336,6 +424,9 @@ def resume(agent, draft_id=None):
                 if receipt and receipt.get('found'):
                     draft = journal.put(_created(agent, draft, receipt=receipt))
                     results.append(_public(draft))
+            continue
+        if _identity_changed(agent, draft):  # never sent, nor its receipt read, as another agent
+            results.append(_public(journal.put(_stale_identity(agent, draft))))
             continue
         if state == 'unresolved':  # never resent: its one replay is spent
             receipt = _receipt(agent, draft['id'])
@@ -393,9 +484,7 @@ def listing(agent):
 
 def discard(agent, draft_id):
     journal = Journal(agent)
-    drafts = journal.load()
-    kept = [d for d in drafts if d.get('id') != draft_id]
-    if len(kept) == len(drafts):
+    kept = journal.remove(draft_id)
+    if kept is None:
         raise AgentError('No kept draft has that request_id.', code='no_such_draft')
-    journal.save(kept)
     return {'discarded': draft_id, 'totals': totals(kept)}
