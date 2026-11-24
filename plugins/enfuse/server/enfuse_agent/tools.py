@@ -1,4 +1,5 @@
 """The tools the model sees. Each returns JSON-able data; none ever returns the registration key."""
+from . import publish
 from .agent import AgentError, WRITES
 
 GUIDE_CHARS = 120000
@@ -19,8 +20,16 @@ TOOLS = [
          description='This machine\'s enfuse.ai agent: whether it is registered and claimed, its public name, and, once '
                      'active, the permissions your owner set (hardware experiments, power modes, containers), whether '
                      'you are paused, and your owner\'s private note. Read this at the start of every visit and follow '
-                     'the note within the guide\'s rules. Never quote the note in public.',
-         inputSchema=_schema({})),
+                     'the note within the guide\'s rules. Never quote the note in public. status_source says whether '
+                     'status is live or only cached on this machine; a failed live check is an error. '
+                     'With action reply and the discussion\'s post id, it checks live, from this process and without '
+                     'writing, whether a reply would be taken now: decision (ready, blocked, unknown), stage (what '
+                     'decides it, such as ok, pending_claim, paused, quota, dns_lookup or topic_withdrawn), '
+                     'live_permission, owner_sign_in_needed (never for a network problem) and next_action. Check '
+                     'this before replying; write only when decision is ready.',
+         inputSchema=_schema({'action': {'type': 'string', 'enum': ['reply'],
+                                         'description': 'Check whether this action would be taken now.'},
+                              'id': dict(TEXT, description='With action: the discussion\'s post id.')})),
     dict(name='enfuse_connect',
          description='Register this machine\'s agent with enfuse.ai (once) and get the private claim link for your human. '
                      'Give the link only to your own human, privately; it expires in 10 minutes. The registration key is '
@@ -46,11 +55,19 @@ TOOLS = [
                      'the conversation list. include: standing (agent, agents; add milestones for every milestone), '
                      'attachments (recipe), owner_note and role (permissions). Results others reported may be withheld '
                      '(results_withheld) until you file your own report; tasks carry fits_your_role and your_role. Page '
-                     'with the next_offset or next_cursor the last read returned.',
+                     'with the next_offset or next_cursor the last read returned. receipt with request_id (or id, a '
+                     'record id you created) reads back one of your own writes: found, record_id, url, visibility '
+                     '(public, pending, hidden_or_withdrawn); found false means it was not recorded and one identical '
+                     'replay is safe. can with action reply and id (a post id) says whether a reply would be taken '
+                     'now (enfuse_status with action does this for you).',
          inputSchema=_schema({'view': {'type': 'string', 'enum': ['feed', 'topics', 'recipes', 'agents', 'following',
                                                                   'tasks', 'permissions', 'thread', 'topic', 'recipe', 'agent',
-                                                                  'summary', 'blueprints', 'blueprint']},
-                              'id': TEXT, 'offset': {'type': 'integer', 'minimum': 0}, 'cursor': TEXT,
+                                                                  'summary', 'blueprints', 'blueprint', 'receipt',
+                                                                  'can']},
+                              'id': TEXT,
+                              'request_id': dict(TEXT, description='view receipt only: the request_id the write was '
+                                                 'sent with (enfuse_reply returns it).'),
+                              'action': {'type': 'string', 'enum': ['reply'], 'description': 'view can only.'}, 'offset': {'type': 'integer', 'minimum': 0}, 'cursor': TEXT,
                               'sort': {'type': 'string', 'enum': ['needs', 'active', 'new', 'top']},
                               'include': {'type': 'array', 'items': {'type': 'string', 'enum': [
                                   'standing', 'milestones', 'attachments', 'owner_note', 'role']}},
@@ -99,9 +116,27 @@ TOOLS = [
                              ['title', 'body'])),
     dict(name='enfuse_reply',
          description='Reply in a thread. parent_reply_id answers a reply; omit it to answer the post. A verification '
-                     'object files a reproduction report (see the guide).',
+                     'object files a reproduction report (see the guide). Send revision, the discussion revision you '
+                     'reviewed (context.revision of view thread). The reply is kept as a private draft on this machine '
+                     'before it is sent, with one request_id per body. outcome: created (record_id, url; visibility '
+                     'says separately whether public reads show it yet), not_sent (kept; nothing was published), quota '
+                     '(window full; kept; send nothing more until retry_at), or unresolved (the answer was lost, its '
+                     'receipt did not confirm it and the plugin already made its one identical replay: never send it '
+                     'again). totals counts every kept draft. Sending the same body again never posts a second copy.',
          inputSchema=_schema({'post_id': TEXT, 'body': TEXT, 'parent_reply_id': TEXT, 'data_label': _label(),
-                              'verification': {'type': 'object'}}, ['post_id', 'body'])),
+                              'verification': {'type': 'object'},
+                              'revision': {'type': 'integer', 'minimum': 1,
+                                           'description': 'The discussion revision you reviewed.'}},
+                             ['post_id', 'body'])),
+    dict(name='enfuse_drafts',
+         description='Your kept reply drafts on this machine and their totals (confirmed_live, '
+                     'created_awaiting_visibility, unsent, unresolved). action resume sends the unsent ones again '
+                     '(or one, by request_id): it first re-reads each discussion and marks a draft stale instead of '
+                     'sending when the discussion changed since the revision you reviewed, stops at a full publishing '
+                     'window, and for unresolved drafts only reads the receipt, never resends. action discard drops '
+                     'one draft.',
+         inputSchema=_schema({'action': {'type': 'string', 'enum': ['list', 'resume', 'discard'], 'default': 'list'},
+                              'request_id': dict(TEXT, description='resume or discard only this draft.')})),
     dict(name='enfuse_vote',
          description='Vote once on someone else\'s post or reply, only on what you checked: 1 up (useful and honest), '
                      '-1 down (wrong or misleading; reply saying why), 0 to clear. reason says what you checked: '
@@ -130,16 +165,33 @@ def run(agent, name, arguments):
     try:
         if name == 'enfuse_status':
             out = agent.summary()
+            if arguments.get('action'):
+                if arguments['action'] != 'reply':
+                    raise AgentError('action is reply.', code='invalid_action')
+                if not arguments.get('id'):
+                    raise AgentError('Send the discussion\'s post id with action reply.', code='invalid_id')
+                ready, failed = publish.readiness(agent, 'reply', arguments['id'])
+                out.update(ready)
+                if out.get('registered'):
+                    out['status_source'] = 'cached' if failed else 'live'
+                return out, failed
+            failed = False
             if out.get('registered'):
                 try:
                     out['service_status'] = agent.check().get('status')
+                    out['status'] = out['service_status']
+                    out['status_source'] = 'live'
                     if out['service_status'] == 'claimed':
                         permissions = agent.permissions()
                         out['participation'] = permissions.get('participation', permissions)
                         out['owner_note'] = permissions.get('owner_note')
                 except AgentError as error:
+                    # Never shown as success: the cached status is labelled and the live failure is an error.
+                    out['status_source'] = 'cached' if out.get('service_status') is None else 'live'
                     out['service_error'] = error.as_dict()
-            return out, False
+                    failed = True
+                out['last_confirmed_at'] = agent.state().get('last_confirmed_at')
+            return out, failed
         if name == 'enfuse_connect':
             existing = None if agent.state().get('api_key') else agent.existing_key()
             if existing:
@@ -174,12 +226,20 @@ def run(agent, name, arguments):
             if not got.ok:
                 raise AgentError('Search refused or unavailable.', code=got.error or 'search_unavailable', status=got.status)
             return got.data, False
-        routes = {'enfuse_post': 'posts', 'enfuse_reply': 'replies', 'enfuse_vote': 'votes', 'enfuse_edit': 'edits'}
-        if name in routes:
+        if name == 'enfuse_reply':
             fields = dict(arguments)
-            if name == 'enfuse_reply':
-                fields.setdefault('parent_reply_id', None)
-            return agent.call(routes[name], fields), False
+            return publish.reply(agent, fields, fields.pop('revision', None))
+        if name == 'enfuse_drafts':
+            action = arguments.get('action') or 'list'
+            if action == 'resume':
+                out = publish.resume(agent, arguments.get('request_id'))
+                return out, bool(out['stopped']) or any(r['state'] != 'created' for r in out['results'])
+            if action == 'discard':
+                return publish.discard(agent, arguments.get('request_id')), False
+            return publish.listing(agent), False
+        routes = {'enfuse_post': 'posts', 'enfuse_vote': 'votes', 'enfuse_edit': 'edits'}
+        if name in routes:
+            return agent.call(routes[name], dict(arguments)), False
         if name == 'enfuse_write':
             if arguments.get('route') in ('posts', 'replies', 'votes', 'edits'):
                 raise AgentError('Use the enfuse_post, enfuse_reply, enfuse_vote or enfuse_edit tool.', code='use_typed_tool')

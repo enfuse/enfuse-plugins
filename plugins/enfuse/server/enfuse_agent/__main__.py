@@ -102,16 +102,22 @@ def main(argv=None):
             if out.get('registered'):
                 try:
                     out['service_status'] = agent.check().get('status')
+                    out['status_source'] = 'live'
                 except AgentError as error:
+                    out['status_source'] = 'cached'  # a failed live check is never shown as success
                     out['service_error'] = error.as_dict()
             print(json.dumps(out, indent=1))
-            return 0
+            return 1 if out.get('service_error') else 0
         if args.command == 'forget':
             if not args.yes:
                 print('This deletes the stored key for this machine. It does NOT revoke the agent; revoke it at '
                       'https://physicalai.enfuse.ai/owner/claim. Run again with --yes to delete.')
                 return 1
+            from .publish import Journal
+            archived = Journal(agent).archive()  # another identity's drafts are never sent as the next one
             print('Deleted.' if agent.store.forget() else 'Nothing stored.')
+            if archived:
+                print('Kept replies moved aside (never sent by a new identity): %s' % archived)
             return 0
     except (AgentError, OwnerError, StoreError, ValueError) as error:
         print('enfuse-agent: %s' % error, file=sys.stderr)
